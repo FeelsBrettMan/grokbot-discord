@@ -6,27 +6,23 @@
 #>
 param([Parameter(Mandatory = $true)][string]$Target)
 $ErrorActionPreference = 'Stop'
-$TaskName = 'DiscordGrokBridge'
+. (Join-Path $PSScriptRoot 'common.ps1')
 $Source = $PSScriptRoot
-$Target = (Resolve-Path $Target).Path
+$Target = (Resolve-Path $Target).Path.TrimEnd('\')
 if ($Source -eq $Target) { throw 'Run update.ps1 from the NEW unzipped folder, not from the install folder.' }
 if (-not (Test-Path (Join-Path $Target '.env'))) { throw "No .env in $Target - is that the install folder?" }
+if (-not (Test-IsAdmin)) { throw 'Run update.ps1 from an Administrator PowerShell.' }
 
 # 1. Stop the task and any listener running from the install folder.
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-}
-Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Target*" -and $_.ProcessId -ne $PID } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 2
+Stop-Bridge $Target
 
 # 2. Replace code files only (never .env, data, logs, .venv).
 $reqOld = Join-Path $Target 'requirements.txt'
 $oldHash = if (Test-Path $reqOld) { (Get-FileHash $reqOld).Hash } else { '' }
 Remove-Item -Recurse -Force (Join-Path $Target 'discord_bridge'), (Join-Path $Target 'tests') -ErrorAction SilentlyContinue
 Copy-Item -Recurse -Force (Join-Path $Source 'discord_bridge'), (Join-Path $Source 'tests') $Target
-foreach ($f in @('install.ps1', 'run.ps1', 'status.ps1', 'uninstall.ps1', 'update.ps1', 'requirements.txt',
+foreach ($f in @('install.ps1', 'run.ps1', 'status.ps1', 'uninstall.ps1', 'update.ps1', 'restart.ps1',
+                 'common.ps1', 'requirements.txt',
                  'requirements-dev.txt', 'pyproject.toml', 'README.md', 'ROUTINE-PROMPT.md', 'LICENSE',
                  '.env.example')) {
     $p = Join-Path $Source $f
@@ -77,9 +73,7 @@ foreach ($k in $wanted.Keys) {
 Set-Content -Path $envPath -Value $lines -Encoding ASCII   # keeps the file's locked-down ACL
 
 # 5. Check config, then restart.
-Set-Location $Target
-& $venvPy -m discord_bridge --check
-if ($LASTEXITCODE -ne 0) { throw 'Config check failed - fix .env, then Start-ScheduledTask DiscordGrokBridge' }
-Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 8
-& (Join-Path $Target 'status.ps1')
+if (-not (Test-BridgeConfig $Target)) {
+    throw 'Config check failed - fix .env, then run restart.ps1 in the install folder.'
+}
+Start-Bridge $Target 10

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import uuid
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 import aiohttp
 import discord
 
+from discord_bridge import __version__
 from discord_bridge.batching import ChannelBatcher
 from discord_bridge.config import DEPRECATED_NOTES, ConfigError, Settings, load_settings
 from discord_bridge.filters import (
@@ -19,7 +21,7 @@ from discord_bridge.filters import (
     strip_user_mention,
 )
 from discord_bridge.history import cap_history, cap_total, history_entry, message_entry
-from discord_bridge.lock import acquire
+from discord_bridge.lock import acquire, acquire_mutex, watch_parent
 from discord_bridge.logsetup import setup_logging
 from discord_bridge.models import IncomingMessage, WakePayload
 from discord_bridge.state import StateStore
@@ -327,9 +329,14 @@ def main() -> None:
         )
         return
     lock = acquire(settings.data_dir / "bridge.lock")
-    if lock is None:
+    mutex = acquire_mutex() if lock is not None else None
+    if lock is None or mutex is None:
         log.error("another bridge instance is already running; exiting")
         sys.exit(EXIT_ALREADY_RUNNING)
+    parent = os.environ.get("BRIDGE_PARENT_PID", "")
+    watch_parent(int(parent) if parent.isdigit() else None)
+    log.info("listener starting: version %s pid %d supervisor %s", __version__, os.getpid(),
+             parent or "none")
     client = BridgeClient(settings)
     try:
         client.run(settings.discord_token, log_handler=None)

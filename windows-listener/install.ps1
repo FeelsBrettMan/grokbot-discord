@@ -7,7 +7,7 @@
 param([switch]$NoTask)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$TaskName = 'DiscordGrokBridge'
+$TaskName = 'DiscordGrokBridge'   # also set in common.ps1
 
 function Find-Python {
     foreach ($c in @(@('py', '-3.13'), @('py', '-3.12'), @('py', '-3'), @('python'))) {
@@ -64,6 +64,10 @@ if (-not $isAdmin) {
     Write-Host 'Registering the auto-start task needs an Administrator PowerShell. Re-run there.' -ForegroundColor Yellow
     exit 3
 }
+
+# Re-install: stop any listener already running from this folder first.
+. (Join-Path $PSScriptRoot 'common.ps1')
+Stop-Bridge $PSScriptRoot
 
 $run = Join-Path $PSScriptRoot 'run.ps1'
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `

@@ -35,7 +35,8 @@ DISCORD_TRUSTED_AUTHORS=YOUR_DISCORD_USER_ID
 DISCORD_CHAT_AUTHORS=111111111111111111,222222222222222222
 ```
 
-`Stop-ScheduledTask DiscordGrokBridge; Start-ScheduledTask DiscordGrokBridge`
+Then, from an Administrator PowerShell in the install folder:
+`powershell -ExecutionPolicy Bypass -File .\restart.ps1`
 
 The Grok Bot side has its own copy of the lists (`~/.config/discord-bridge/allowlist.json`
 on the Bot's computer); ask the Bot to add the same IDs there. Both must match.
@@ -81,19 +82,40 @@ Task Scheduler task `DiscordGrokBridge`:
 - starts at boot, runs whether or not you are logged in (S4U logon, no stored
   password, normal user rights, no admin);
 - `run.ps1` restarts the listener if it exits (10 s, backing off to 5 min);
-- a 5-minute watchdog trigger restarts `run.ps1` if it ever dies (the task's
-  "do not start a new instance" rule stops duplicates; the app also holds a
-  lock file so two copies can never run).
+- a 5-minute watchdog trigger restarts `run.ps1` if it ever dies.
+
+Only one listener can ever run: a lock file in `data\` plus a machine-wide
+named mutex (so even a second copy in another folder exits with "another bridge
+instance is already running"). `run.ps1` puts the listener in a Windows Job
+object that is killed when the task stops, and the listener also exits on its
+own if `run.ps1` disappears, so stopping the task never leaves an orphan.
+
+## Restart after editing .env
+
+Use `restart.ps1`, not `Stop-ScheduledTask`/`Start-ScheduledTask` (older
+versions left the python process running, so the change never took effect).
+Administrator PowerShell:
+
+```
+cd C:\discord-bridge
+powershell -ExecutionPolicy Bypass -File .\restart.ps1
+```
+
+It stops the task, kills every leftover process started from that folder, runs
+the config check (stops with a clear message if `.env` is wrong), starts the
+task and prints the last 10 log lines. Look for a fresh `config ok: ...`, then
+`listener starting: version 0.3.1 ...` and `online as ...`. `-Target <folder>`
+restarts another install folder.
 
 Config errors (bad token, missing intent, empty guild/channel/trusted list) stop it instead of
-looping; fix `.env` and run `Start-ScheduledTask DiscordGrokBridge`.
+looping; fix `.env` and run `.\restart.ps1`.
 
 ## Everyday commands
 
 | | |
 |---|---|
 | status + last log lines | `.\status.ps1` |
-| restart after editing .env | `Stop-ScheduledTask DiscordGrokBridge; Start-ScheduledTask DiscordGrokBridge` |
+| restart after editing .env (Admin) | `powershell -ExecutionPolicy Bypass -File .\restart.ps1` |
 | run in a window (debug) | `.\run.ps1` (stop the task first) |
 | config check only | `.\.venv\Scripts\python.exe -m discord_bridge --check` |
 | update | `.\update.ps1 -Target C:\discord-bridge` (from the new unzipped folder) |
