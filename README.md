@@ -38,7 +38,9 @@ Discord channel  (the listener sees the bot's post -> run finished, older buffer
 ```
 
 While a run is in flight the listener keeps the typing indicator alive. A run
-ends when the bot posts in the channel or after 5 minutes.
+ends when the bot posts in the channel or after 5 minutes. Only one listener
+instance can run per PC (lock file + named mutex), and stopping the task also
+stops the python process (Job object + parent watchdog).
 
 ## Setup
 
@@ -55,7 +57,8 @@ ends when the bot posts in the channel or after 5 minutes.
    trusted list is empty. Keep it in sync with the listener's `.env`
    (`DISCORD_TRUSTED_AUTHORS`, `DISCORD_CHAT_AUTHORS`).
 4. **Windows PC**: follow [windows-listener/README.md](windows-listener/README.md)
-   (`install.ps1`, fill `.env`, auto-start task; `update.ps1` for upgrades).
+   (`install.ps1`, fill `.env`, auto-start task; `restart.ps1` after editing `.env`,
+   `update.ps1` for upgrades).
 5. Test: write in the channel. You should see the typing indicator, then a reply.
 
 Run only one listener per bot token, or every message is forwarded twice.
@@ -88,7 +91,9 @@ git-ignored, and all IDs in examples are placeholders.
   the observation that long routine webhook bodies can be truncated, so small
   identifying fields go first.
 - The trusted vs chat-only split and group batching (v0.3.0 of the Windows
-  listener) are this fork's own design; no outside code.
+  listener) and the restart/orphan handling (v0.3.1: `restart.ps1`, Job object,
+  parent watchdog, machine-wide mutex) are this fork's own design; no outside code.
+  The one-instance-per-token rule they enforce is the NinjaProtocol idea above.
 - Dependencies: [discord.py](https://github.com/Rapptz/discord.py) (MIT),
   [aiohttp](https://github.com/aio-libs/aiohttp) (Apache-2.0),
   [PyYAML](https://github.com/yaml/pyyaml) (MIT, box bridge only).
