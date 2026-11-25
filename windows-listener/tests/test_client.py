@@ -19,8 +19,11 @@ def _msg(mid, author, content="hi", channel_id=2):
     )
 
 
-BRETT = _author(3, "Brett")
-DAVE = _author(9, "Dave", bot=True)
+BRETT = _author(3, "Brett")  # trusted
+ALEX = _author(4, "Alex")  # chat-only
+STRANGER = _author(8, "Stranger")
+OTHER_BOT = _author(4, "Alex", bot=True)  # even a listed ID is ignored if it's a bot
+DAVE = _author(9, "Dave", bot=True)  # this bot
 
 
 class FakeChannel:
@@ -42,10 +45,11 @@ class FakeChannel:
 @pytest.fixture
 def client(tmp_path):
     s = Settings(
-        discord_token="t", guilds={"1"}, channels={"2"}, authors={"3"}, require_mention=False,
+        discord_token="t", guilds={"1"}, channels={"2"}, trusted={"3"}, chat={"4"},
+        require_mention=False,
         bot_name="grok", webhook_url="https://example.test", webhook_key="k", debounce_s=0.0,
         in_flight_timeout_s=300, history_limit=12, history_chars=3000, history_entry_chars=600,
-        text_chars=4000, catchup_limit=100,
+        message_chars=1500, batch_chars=4000, catchup_limit=100,
         data_dir=tmp_path, log_file=tmp_path / "b.log", dry_run=True,
     )
     c = BridgeClient(s)
@@ -61,50 +65,74 @@ async def _drain():
         await asyncio.sleep(0)
 
 
-async def test_forward_batch_and_reply_ends_run(client):
-    ch = FakeChannel([_msg(10, BRETT, "earlier"), _msg(11, DAVE, "earlier reply")])
+async def test_group_batch_mixed_authors_and_reply_coverage(client):
+    ch = FakeChannel([
+        _msg(10, BRETT, "earlier"), _msg(11, STRANGER, "hidden"), _msg(12, DAVE, "earlier reply"),
+        _msg(13, ALEX, "chat earlier"),
+    ])
     client.get_channel = lambda i: ch
     await client.on_message(_msg(20, BRETT, "first"))
-    await client.on_message(_msg(21, BRETT, "second"))
-    await client.on_message(_msg(22, _author(8, "Stranger"), "ignored"))
+    await client.on_message(_msg(21, ALEX, "me too"))
+    await client.on_message(_msg(22, STRANGER, "ignored"))
+    await client.on_message(_msg(23, OTHER_BOT, "ignored bot"))
     assert ch.typed >= 1
     await client.tick()
     await _drain()
     p = client.dry_run_log[0]
-    assert p["text"] == "first\nsecond"
-    assert p["message_ids"] == ["20", "21"] and p["message_id"] == "21"
-    assert [h["author"] for h in p["history"]] == ["Brett", "Dave"]
-    assert p["history"][1]["is_bot"] is True
-    assert p["reply_mode"] == "discord_rest"
+    assert p["batch_has_trusted"] is True and p["trusted_author_ids"] == ["3"]
+    assert [(m["message_id"], m["author_id"], m["trusted"], m["text"]) for m in p["messages"]] == [
+        ("20", "3", True, "first"), ("21", "4", False, "me too"),
+    ]
+    assert p["message_id"] == "21"
+    assert [(h["author"], h["trusted"], h["is_bot"]) for h in p["history"]] == [
+        ("Brett", True, False), ("Dave", False, True), ("Alex", False, False),
+    ]  # the stranger is included nowhere
     assert client.state.get("2") == "21"
-    # Brett sends more while the run is in flight: held, not forwarded
-    await client.on_message(_msg(23, BRETT, "third"))
+    # more people talk while the run is in flight: held, not forwarded
+    await client.on_message(_msg(24, ALEX, "also this"))
+    await client.on_message(_msg(25, BRETT, "and this"))
     await client.tick()
     assert len(client.dry_run_log) == 1
-    # the routine's reply (our own bot user) ends the run; next batch goes out
-    await client.on_message(_msg(24, DAVE, "answer"))
+    # the routine re-fetched 24/25 before posting, so its reply (26) covers them
+    await client.on_message(_msg(27, ALEX, "after the reply"))
+    await client.on_message(_msg(26, DAVE, "answer"))
     await client.tick()
     await _drain()
-    assert client.dry_run_log[1]["text"] == "third"
+    assert len(client.dry_run_log) == 2
+    p2 = client.dry_run_log[1]
+    assert [m["message_id"] for m in p2["messages"]] == ["27"]
+    assert p2["batch_has_trusted"] is False and p2["trusted_author_ids"] == []
+    assert client.state.get("2") == "27"
+
+
+async def test_chat_only_batch(client):
+    ch = FakeChannel([])
+    client.get_channel = lambda i: ch
+    await client.on_message(_msg(40, ALEX, "hey bot"))
+    await client.tick()
+    await _drain()
+    p = client.dry_run_log[0]
+    assert p["batch_has_trusted"] is False and p["messages"][0]["trusted"] is False
 
 
 async def test_catch_up_after_disconnect(client):
     client.state.set("2", "30")
     ch = FakeChannel([
         _msg(30, BRETT, "old"), _msg(31, BRETT, "answered"), _msg(32, DAVE, "reply"),
-        _msg(33, BRETT, "missed 1"), _msg(34, _author(8, "Other"), "x"),
-        _msg(35, BRETT, "missed 2"),
+        _msg(33, BRETT, "missed 1"), _msg(34, STRANGER, "x"),
+        _msg(35, ALEX, "missed 2"),
     ])
     client.get_channel = lambda i: ch
     await client.catch_up("ready")
     await client.tick()
     await _drain()
     assert len(client.dry_run_log) == 1
-    assert client.dry_run_log[0]["text"] == "missed 1\nmissed 2"
+    msgs = client.dry_run_log[0]["messages"]
+    assert [(m["text"], m["trusted"]) for m in msgs] == [("missed 1", True), ("missed 2", False)]
     assert client.state.get("2") == "35"
     # a live duplicate of a caught-up message is ignored
-    await client.on_message(_msg(35, BRETT, "missed 2"))
-    assert not client.batcher.active("2") or client.batcher.in_flight("2")
+    await client.on_message(_msg(35, ALEX, "missed 2"))
+    assert not client.batcher.channels["2"].buffer
 
 
 async def test_catch_up_noop_on_first_run(client):

@@ -24,13 +24,22 @@ class Dedupe:
         return False
 
 
-def require_allowlists(guilds: set[str], channels: set[str], authors: set[str]) -> None:
+def require_allowlists(guilds: set[str], channels: set[str], trusted: set[str]) -> None:
     if not guilds:
         raise ConfigError("DISCORD_GUILD_ALLOWLIST is empty")
     if not channels:
         raise ConfigError("DISCORD_CHANNEL_ALLOWLIST is empty")
-    if not authors:
-        raise ConfigError("DISCORD_AUTHOR_ALLOWLIST is empty")
+    if not trusted:
+        raise ConfigError("DISCORD_TRUSTED_AUTHORS is empty")
+
+
+def classify(author_id: str, trusted: set[str], chat: set[str]) -> str | None:
+    """'trusted', 'chat', or None (not allowed). Trusted wins if listed in both."""
+    if author_id in trusted:
+        return "trusted"
+    if author_id in chat:
+        return "chat"
+    return None
 
 
 def strip_user_mention(content: str, user_id: str) -> str:
@@ -48,9 +57,10 @@ def should_drop(
     self_user_id: str,
     guilds: set[str],
     channels: set[str],
-    authors: set[str],
+    trusted: set[str],
+    chat: set[str],
     require_mention: bool,
-    dedupe: Dedupe,
+    dedupe: Dedupe | None,
     named: bool = False,
 ) -> str | None:
     """Fail-closed filter. Returns a drop reason, or None to forward."""
@@ -62,10 +72,10 @@ def should_drop(
         return "guild"
     if msg.channel_id not in channels:
         return "channel"
-    if msg.author_id not in authors:
+    if classify(msg.author_id, trusted, chat) is None:
         return "author"
     if require_mention and self_user_id not in msg.mention_user_ids and not named:
         return "mention"
-    if dedupe.already_seen(msg.message_id):
+    if dedupe is not None and dedupe.already_seen(msg.message_id):
         return "duplicate"
     return None

@@ -10,6 +10,7 @@ def make_msg(**overrides) -> IncomingMessage:
         author_name="Brett",
         content="hello",
         mention_user_ids=frozenset(),
+        timestamp="2026-01-01T00:00:00+00:00",
     )
     base.update(overrides)
     return IncomingMessage(**base)

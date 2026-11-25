@@ -1,9 +1,10 @@
 """Per-channel debounce + single run in flight, without a reply callback.
 
-A channel flushes once `debounce_s` has passed since the last buffered message
-(or the last bot post) and no run is in flight. A run counts as finished when
-the bot itself posts in the channel, or after `timeout_s`. Messages that arrive
-while a run is in flight are batched into the next wake.
+Every allowed message (trusted or chat-only) is buffered per channel. A channel
+flushes once `debounce_s` has passed since the last buffered message (or the
+last bot post) and no run is in flight. A run counts as finished when the bot
+itself posts in the channel, or after `timeout_s`. Buffered messages older than
+that reply are dropped (the reply covered them); newer ones form the next batch.
 """
 
 from __future__ import annotations
@@ -84,19 +85,29 @@ class ChannelBatcher:
     def wake_ok(self, channel_id: str) -> None:
         self._state(channel_id).attempts = 0
 
-    def bot_posted(self, channel_id: str) -> bool:
-        """The bot posted in the channel: end the run in flight (if any).
+    def bot_posted(self, channel_id: str, post_id: str) -> tuple[bool, list[IncomingMessage]]:
+        """The bot posted in the channel.
 
-        Also counts as activity so buffered messages wait one more debounce
-        window, which lets a multi-part reply finish before the next wake.
+        If a run was in flight, this post is its reply: end the run and drop the
+        buffered messages older than the post (the replier re-fetched them before
+        posting, so the reply already covered them). Later posts of the same reply
+        (extra chunks) only count as activity, so newer messages wait one more
+        debounce window before the next wake. Returns (ended_run, dropped).
         """
         st = self.channels.get(channel_id)
         if st is None:
-            return False
-        was = st.in_flight is not None
-        st.in_flight = None
+            return False, []
         st.last_activity = self.clock()
-        return was
+        if st.in_flight is None:
+            return False, []
+        st.in_flight = None
+        try:
+            pid = int(post_id)
+        except ValueError:
+            return True, []
+        dropped = [m for m in st.buffer if int(m.message_id) < pid]
+        st.buffer = [m for m in st.buffer if int(m.message_id) >= pid]
+        return True, dropped
 
     def expire(self) -> list[str]:
         now = self.clock()

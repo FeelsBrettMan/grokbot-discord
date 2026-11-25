@@ -1,28 +1,46 @@
 # Discord -> Grok Bot listener (Windows)
 
-Listens to one private Discord channel and forwards the owner's messages to the Grok
+Listens to one private Discord channel and forwards allowlisted people's messages to the Grok
 Bot routine webhook. The routine replies to Discord directly over REST (see `../box/` and
 `../docs/routine-prompt-discord-rest.md`).
 Based on RudeDude/grokbot-discord (MIT) plus local hardening.
 
 ## What it does
 
-- Forwards every message from the allowlisted author in the allowlisted
-  server/channel (no @mention needed). Ignores the bot itself, other bots and
-  everyone else. Empty or invalid allowlists = it refuses to start.
-- Waits 3 s after the owner's last message, then sends one wake with all new messages
-  combined (max ~4000 chars), plus up to the last 12 channel messages as `history`
-  (max ~3000 chars total, ~600 per message). Small fields go first in the JSON so a
-  truncated wake still has correlation_id and the message IDs.
-- Shows "YourBot is typing..." from the moment the owner writes until the reply appears.
-- One run per channel at a time: a run is finished when the bot posts in the
-  channel (the routine's reply) or after 5 minutes. Messages sent meanwhile go
-  out together as the next wake.
+- Group chat: forwards messages from **trusted** people (full control) and
+  **chat-only** people (conversation only) in the allowlisted server/channel, no
+  @mention needed. Everyone else and other bots are ignored completely (not
+  forwarded, not in history). Empty guild/channel/trusted lists = it refuses to start.
+- Buffers everything said since the bot's last post, waits 3 s after the last
+  message, then sends one wake with all of it (`messages`, each marked
+  `trusted` true/false) plus up to the last 12 earlier messages as `history`.
+- One run per channel at a time. When the bot posts (the routine's reply), the
+  run ends and buffered messages from before that post are dropped, because the
+  routine re-fetches right before posting and its reply covers them. Messages
+  after the post start the next batch. No reply within 5 minutes releases the run.
+- Shows "YourBot is typing..." while a batch is pending or a run is in flight.
 - Catch-up: remembers the last forwarded message (`data\state.json`). After a
-  restart or reconnect it forwards the owner's messages it missed (unless the bot
-  already replied after them) as one batch.
+  restart or reconnect it forwards missed messages from allowed people (unless the
+  bot already replied after them) as one batch.
 - Failed webhook calls are retried twice (15 s, 30 s backoff), then dropped and logged.
 - Logs to `logs\bridge.log` (rotating, 5 x 2 MB) with the token/key redacted.
+
+## Adding people
+
+In `.env` on the PC (comma-separated Discord user IDs; right-click a user with
+Developer Mode on, Copy User ID), then restart the task:
+
+```
+DISCORD_TRUSTED_AUTHORS=YOUR_DISCORD_USER_ID
+DISCORD_CHAT_AUTHORS=111111111111111111,222222222222222222
+```
+
+`Stop-ScheduledTask DiscordGrokBridge; Start-ScheduledTask DiscordGrokBridge`
+
+The Grok Bot side has its own copy of the lists (`~/.config/discord-bridge/allowlist.json`
+on the Bot's computer); ask the Bot to add the same IDs there. Both must match.
+`DISCORD_AUTHOR_ALLOWLIST` still works as an old name for `DISCORD_TRUSTED_AUTHORS`;
+`update.ps1` renames it.
 
 ## Install
 
@@ -36,7 +54,7 @@ Based on RudeDude/grokbot-discord (MIT) plus local hardening.
    ```
    The first run creates `.env` and stops.
 4. `notepad .env`: replace the three `changeme` values (bot token, routine webhook
-   URL, webhook key) and the three `YOUR_...` allowlist IDs. Save.
+   URL, webhook key) and the `YOUR_...` allowlist IDs. Save.
 5. Run `install.ps1` again (same command). It checks the config, registers the
    `DiscordGrokBridge` scheduled task and starts it.
 6. Check: `.\status.ps1` should say Running and the log should show
@@ -53,8 +71,9 @@ Then send a message in the channel: you should see "YourBot is typing..." and a 
    powershell -ExecutionPolicy Bypass -File .\update.ps1 -Target C:\discord-bridge
    ```
 It stops the task, replaces code files only (keeps `.env`, `data\state.json`,
-`logs\`), reinstalls packages only if `requirements.txt` changed, moves old
-default limits in `.env` to the new ones, checks config and restarts the task.
+`logs\`), reinstalls packages only if `requirements.txt` changed, migrates `.env`
+(`DISCORD_AUTHOR_ALLOWLIST` -> `DISCORD_TRUSTED_AUTHORS`, adds `DISCORD_CHAT_AUTHORS=`
+and the new caps), checks config and restarts the task.
 
 ## Auto-start / auto-restart
 
@@ -66,7 +85,7 @@ Task Scheduler task `DiscordGrokBridge`:
   "do not start a new instance" rule stops duplicates; the app also holds a
   lock file so two copies can never run).
 
-Config errors (bad token, missing intent, empty allowlist) stop it instead of
+Config errors (bad token, missing intent, empty guild/channel/trusted list) stop it instead of
 looping; fix `.env` and run `Start-ScheduledTask DiscordGrokBridge`.
 
 ## Everyday commands
@@ -82,12 +101,18 @@ looping; fix `.env` and run `Start-ScheduledTask DiscordGrokBridge`.
 
 ## Payload sent to the webhook
 
-`Authorization: Bearer <GROK_BOT_GROK_WEBHOOK_KEY>`, JSON:
-compact UTF-8, fields in this order:
-`correlation_id, reply_mode="discord_rest", author_id, guild_id, channel_id, message_id,
-message_ids, author_name, bot, text, history[{author, is_bot, text, timestamp}]`.
-A typical body is ~300-350 chars plus text and history; the log line
-`waking ... body_chars=N` shows each wake's size.
+`Authorization: Bearer <GROK_BOT_GROK_WEBHOOK_KEY>`, compact UTF-8 JSON, in this order:
+
+```
+correlation_id, reply_mode="discord_rest", guild_id, channel_id, message_id,
+batch_has_trusted, trusted_author_ids, omitted_count,
+messages[{message_id, author_id, author_name, trusted, text, timestamp}],
+history[{author, author_id, trusted, is_bot, text, timestamp}]
+```
+
+Caps: 1500 chars per message, ~4000 chars for all batch messages (oldest dropped,
+counted in `omitted_count`), history 12 messages / 3000 chars / 600 per entry.
+The log line `waking ... body_chars=N` shows each wake's size.
 
 ## Notes
 

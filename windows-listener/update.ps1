@@ -43,15 +43,34 @@ if ((Get-FileHash $reqOld).Hash -ne $oldHash) {
     if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
 }
 
-# 4. Move .env off the old, larger payload defaults (secrets untouched).
+# 4. Migrate .env (secrets untouched):
+#    - DISCORD_AUTHOR_ALLOWLIST (deprecated) -> DISCORD_TRUSTED_AUTHORS
+#    - add DISCORD_CHAT_AUTHORS= (empty) if missing
+#    - move old default size limits to the new ones; add new caps if missing
 $envPath = Join-Path $Target '.env'
 $lines = [System.Collections.Generic.List[string]](Get-Content -Path $envPath)
+function Find-Key($name) {
+    $i = -1
+    for ($j = 0; $j -lt $lines.Count; $j++) { if ($lines[$j] -match "^\s*$name\s*=") { $i = $j } }
+    return $i
+}
+$legacy = Find-Key 'DISCORD_AUTHOR_ALLOWLIST'
+$trusted = Find-Key 'DISCORD_TRUSTED_AUTHORS'
+if ($legacy -ge 0) {
+    $value = ($lines[$legacy] -replace '^\s*[^=]+=\s*', '').Trim()
+    if ($trusted -lt 0) {
+        $lines[$legacy] = "DISCORD_TRUSTED_AUTHORS=$value"
+        Write-Output 'migrated DISCORD_AUTHOR_ALLOWLIST -> DISCORD_TRUSTED_AUTHORS'
+    } else {
+        $lines[$legacy] = "# deprecated, merged into DISCORD_TRUSTED_AUTHORS: DISCORD_AUTHOR_ALLOWLIST=$value"
+    }
+}
 $wanted = [ordered]@{ HISTORY_LIMIT = @('20', '12'); HISTORY_CHAR_CAP = @('8000', '3000');
-                      HISTORY_ENTRY_CHAR_CAP = @($null, '600'); TEXT_CHAR_CAP = @($null, '4000') }
+                      HISTORY_ENTRY_CHAR_CAP = @($null, '600'); MESSAGE_CHAR_CAP = @($null, '1500');
+                      BATCH_CHAR_CAP = @($null, '4000'); DISCORD_CHAT_AUTHORS = @($null, '') }
 foreach ($k in $wanted.Keys) {
     $old, $new = $wanted[$k]
-    $i = -1
-    for ($j = 0; $j -lt $lines.Count; $j++) { if ($lines[$j] -match "^\s*$k\s*=") { $i = $j } }
+    $i = Find-Key $k
     if ($i -lt 0) { $lines.Add("$k=$new") }
     elseif ($old -and ($lines[$i] -replace '^\s*[^=]+=\s*', '').Trim() -eq $old) { $lines[$i] = "$k=$new" }
 }

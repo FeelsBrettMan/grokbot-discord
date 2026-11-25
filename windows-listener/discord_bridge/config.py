@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,8 @@ from urllib.parse import urlparse
 from discord_bridge.filters import ConfigError, require_allowlists
 
 APP_ROOT = Path(__file__).resolve().parent.parent
+log = logging.getLogger("discord_bridge")
+DEPRECATED_NOTES: list[str] = []
 
 
 def parse_id_list(raw: str) -> set[str]:
@@ -57,7 +60,8 @@ class Settings:
     discord_token: str
     guilds: set[str]
     channels: set[str]
-    authors: set[str]
+    trusted: set[str]
+    chat: set[str]
     require_mention: bool
     bot_name: str
     webhook_url: str
@@ -67,11 +71,30 @@ class Settings:
     history_limit: int
     history_chars: int
     history_entry_chars: int
-    text_chars: int
+    message_chars: int
+    batch_chars: int
     catchup_limit: int
     data_dir: Path
     log_file: Path
     dry_run: bool
+
+
+def parse_authors() -> tuple[set[str], set[str]]:
+    """Trusted (full control) and chat-only authors.
+
+    DISCORD_AUTHOR_ALLOWLIST is a deprecated alias for DISCORD_TRUSTED_AUTHORS and is
+    merged into it. Anyone listed as trusted is removed from the chat list.
+    """
+    DEPRECATED_NOTES.clear()
+    trusted = parse_id_list(os.environ.get("DISCORD_TRUSTED_AUTHORS", ""))
+    legacy = parse_id_list(os.environ.get("DISCORD_AUTHOR_ALLOWLIST", ""))
+    if legacy:
+        DEPRECATED_NOTES.append(
+            "DISCORD_AUTHOR_ALLOWLIST is deprecated; treated as DISCORD_TRUSTED_AUTHORS"
+        )
+        trusted |= legacy
+    chat = parse_id_list(os.environ.get("DISCORD_CHAT_AUTHORS", "")) - trusted
+    return trusted, chat
 
 
 def load_settings(env_file: Path | None = None) -> Settings:
@@ -93,8 +116,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
 
     guilds = parse_id_list(os.environ.get("DISCORD_GUILD_ALLOWLIST", ""))
     channels = parse_id_list(os.environ.get("DISCORD_CHANNEL_ALLOWLIST", ""))
-    authors = parse_id_list(os.environ.get("DISCORD_AUTHOR_ALLOWLIST", ""))
-    require_allowlists(guilds, channels, authors)
+    trusted, chat = parse_authors()
+    require_allowlists(guilds, channels, trusted)
 
     data_dir = Path(os.environ.get("DATA_DIR", APP_ROOT / "data"))
     log_file = Path(os.environ.get("LOG_FILE", APP_ROOT / "logs" / "bridge.log"))
@@ -102,7 +125,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         discord_token=token,
         guilds=guilds,
         channels=channels,
-        authors=authors,
+        trusted=trusted,
+        chat=chat,
         require_mention=_truthy(os.environ.get("REQUIRE_MENTION"), False),
         bot_name=os.environ.get("BOT_NAME", "grok").strip() or "grok",
         webhook_url=url,
@@ -112,7 +136,8 @@ def load_settings(env_file: Path | None = None) -> Settings:
         history_limit=int(_num("HISTORY_LIMIT", 12)),
         history_chars=int(_num("HISTORY_CHAR_CAP", 3000)),
         history_entry_chars=int(_num("HISTORY_ENTRY_CHAR_CAP", 600)),
-        text_chars=int(_num("TEXT_CHAR_CAP", 4000)),
+        message_chars=int(_num("MESSAGE_CHAR_CAP", 1500)),
+        batch_chars=int(_num("BATCH_CHAR_CAP", _num("TEXT_CHAR_CAP", 4000))),
         catchup_limit=int(_num("CATCHUP_LIMIT", 100)),
         data_dir=data_dir,
         log_file=log_file,

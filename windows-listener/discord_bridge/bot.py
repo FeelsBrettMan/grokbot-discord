@@ -10,9 +10,15 @@ import aiohttp
 import discord
 
 from discord_bridge.batching import ChannelBatcher
-from discord_bridge.config import ConfigError, Settings, load_settings
-from discord_bridge.filters import Dedupe, addressed_by_name, should_drop, strip_user_mention
-from discord_bridge.history import cap_history, clip, history_entry
+from discord_bridge.config import DEPRECATED_NOTES, ConfigError, Settings, load_settings
+from discord_bridge.filters import (
+    Dedupe,
+    addressed_by_name,
+    classify,
+    should_drop,
+    strip_user_mention,
+)
+from discord_bridge.history import cap_history, cap_total, history_entry, message_entry
 from discord_bridge.lock import acquire
 from discord_bridge.logsetup import setup_logging
 from discord_bridge.models import IncomingMessage, WakePayload
@@ -36,11 +42,8 @@ def incoming(message: discord.Message) -> IncomingMessage:
         content=message.content or "",
         mention_user_ids=frozenset(str(u.id) for u in message.mentions),
         author_is_bot=bool(message.author.bot),
+        timestamp=message.created_at.isoformat() if getattr(message, "created_at", None) else "",
     )
-
-
-def combine_texts(texts: list[str]) -> str:
-    return "\n".join(t for t in (x.strip() for x in texts) if t)
 
 
 class BridgeClient(discord.Client):
@@ -95,7 +98,10 @@ class BridgeClient(discord.Client):
 
     # ---- inbound ----------------------------------------------------------
 
-    def _accept(self, msg: IncomingMessage) -> bool:
+    def trust_of(self, author_id: str) -> str | None:
+        return classify(author_id, self.settings.trusted, self.settings.chat)
+
+    def _accept(self, msg: IncomingMessage, *, dedupe: bool = True) -> bool:
         assert self.user is not None
         self_id = str(self.user.id)
         reason = should_drop(
@@ -103,9 +109,10 @@ class BridgeClient(discord.Client):
             self_user_id=self_id,
             guilds=self.settings.guilds,
             channels=self.settings.channels,
-            authors=self.settings.authors,
+            trusted=self.settings.trusted,
+            chat=self.settings.chat,
             require_mention=self.settings.require_mention,
-            dedupe=self.dedupe,
+            dedupe=self.dedupe if dedupe else None,
             named=addressed_by_name(
                 strip_user_mention(msg.content, self_id), self.settings.bot_name
             ),
@@ -117,11 +124,17 @@ class BridgeClient(discord.Client):
             return
         msg = incoming(message)
         if msg.author_id == str(self.user.id):
-            # Our own post (the routine replying over REST) ends the run in flight.
-            if msg.channel_id in self.settings.channels and self.batcher.bot_posted(
-                msg.channel_id
-            ):
-                log.info("reply seen in channel %s; run finished", msg.channel_id)
+            # Our own post (the routine replying over REST) ends the run in flight
+            # and covers everything said before it.
+            if msg.channel_id in self.settings.channels:
+                ended, dropped = self.batcher.bot_posted(msg.channel_id, msg.message_id)
+                if ended:
+                    log.info(
+                        "reply seen in channel %s; run finished; %d covered message(s) dropped",
+                        msg.channel_id, len(dropped),
+                    )
+                if dropped:
+                    self.state.set(msg.channel_id, max((m.message_id for m in dropped), key=int))
             return
         if not self._accept(msg):
             return
@@ -129,7 +142,7 @@ class BridgeClient(discord.Client):
         await self._typing(msg.channel_id, force=True)
 
     async def catch_up(self, why: str) -> None:
-        """Forward the owner's messages sent while we were disconnected."""
+        """Forward allowed authors' messages sent while we were disconnected."""
         if self.user is None:
             return
         async with self._catchup_lock:
@@ -198,58 +211,74 @@ class BridgeClient(discord.Client):
             log.warning("typing indicator failed in channel %s", channel_id)
 
     async def history_before(self, channel_id: str, before_id: str) -> list[dict[str, Any]]:
+        """Recent context before the batch: allowed authors and the bot only, oldest first."""
+        assert self.user is not None
+        self_id = str(self.user.id)
         items: list[dict[str, Any]] = []
         try:
             channel = self.get_channel(int(channel_id))
             if channel is None or not hasattr(channel, "history"):
                 return []
             async for m in channel.history(
-                limit=self.settings.history_limit,
+                limit=min(self.settings.history_limit * 4, 100),
                 before=discord.Object(id=int(before_id)),
                 oldest_first=False,
             ):
+                aid = str(m.author.id)
+                trust = self.trust_of(aid)
+                is_self = aid == self_id
+                if not is_self and (trust is None or m.author.bot):
+                    continue  # strangers and other bots are included nowhere
                 author = str(getattr(m.author, "display_name", m.author.name))
-                ts = m.created_at.isoformat()
                 items.append(
                     history_entry(
-                        author, bool(m.author.bot), m.content or "", ts,
-                        self.settings.history_entry_chars,
+                        author, aid, trust == "trusted", is_self, m.content or "",
+                        m.created_at.isoformat(), self.settings.history_entry_chars,
                     )
                 )
+                if len(items) >= self.settings.history_limit:
+                    break
         except Exception:
             log.warning("history fetch failed in channel %s", channel_id)
             return []
         items.reverse()  # oldest first
         return cap_history(items, self.settings.history_chars)
 
+    def build_messages(self, batch: list[IncomingMessage]) -> tuple[list[dict[str, Any]], int]:
+        assert self.user is not None
+        self_id = str(self.user.id)
+        entries = [
+            message_entry(
+                m.message_id, m.author_id, m.author_name, self.trust_of(m.author_id) == "trusted",
+                strip_user_mention(m.content, self_id), m.timestamp, self.settings.message_chars,
+            )
+            for m in batch
+        ]
+        return cap_total(entries, self.settings.batch_chars)
+
     async def flush(self, channel_id: str) -> None:
         correlation_id = uuid.uuid4().hex
         batch = self.batcher.take(channel_id, correlation_id)
         if not batch:
             return
-        assert self.user is not None
-        self_id = str(self.user.id)
         first, last = batch[0], batch[-1]
-        text = clip(
-            combine_texts([strip_user_mention(m.content, self_id) for m in batch]),
-            self.settings.text_chars,
-        )
+        messages, omitted = self.build_messages(batch)
+        trusted_ids = sorted({m["author_id"] for m in messages if m["trusted"]}, key=int)
         payload = WakePayload(
-            bot=self.settings.bot_name,
-            text=text,
-            author_id=last.author_id,
-            author_name=last.author_name,
-            channel_id=channel_id,
-            guild_id=last.guild_id,
-            message_id=last.message_id,
             correlation_id=correlation_id,
-            message_ids=[m.message_id for m in batch],
+            guild_id=last.guild_id,
+            channel_id=channel_id,
+            message_id=last.message_id,
+            trusted_author_ids=trusted_ids,
+            messages=messages,
             history=await self.history_before(channel_id, first.message_id),
+            omitted_count=omitted,
         )
         size = len(encode_body(payload.as_dict()).decode("utf-8"))
         log.info(
-            "waking channel=%s batched=%d history=%d body_chars=%d corr=%s",
-            channel_id, len(batch), len(payload.history), size, correlation_id[:8],
+            "waking channel=%s batched=%d trusted=%s history=%d body_chars=%d corr=%s",
+            channel_id, len(batch), bool(trusted_ids), len(payload.history), size,
+            correlation_id[:8],
         )
         await self._typing(channel_id, force=True)
         asyncio.create_task(self._wake(payload, batch))
@@ -271,13 +300,13 @@ class BridgeClient(discord.Client):
             status = type(exc).__name__
         if status == 200 or (isinstance(status, int) and 200 <= status < 300):
             self.batcher.wake_ok(payload.channel_id)
-            self.state.set(payload.channel_id, payload.message_ids[-1])
+            self.state.set(payload.channel_id, payload.message_id)
             return
         if self.batcher.wake_failed(payload.channel_id, batch):
             log.warning("wake failed (%s); will retry", status)
         else:
             log.error("wake failed (%s) after retries; dropped %d message(s)", status, len(batch))
-            self.state.set(payload.channel_id, payload.message_ids[-1])
+            self.state.set(payload.channel_id, payload.message_id)
 
 
 def main() -> None:
@@ -287,10 +316,13 @@ def main() -> None:
         print(f"config error: {exc}", file=sys.stderr)
         sys.exit(EXIT_CONFIG)
     setup_logging(settings.log_file, [settings.discord_token, settings.webhook_key])
+    for note in DEPRECATED_NOTES:
+        log.warning(note)
     if "--check" in sys.argv:
         log.info(
-            "config ok: guilds=%d channels=%d authors=%d require_mention=%s dry_run=%s",
-            len(settings.guilds), len(settings.channels), len(settings.authors),
+            "config ok: guilds=%d channels=%d trusted=%d chat=%d require_mention=%s dry_run=%s",
+            len(settings.guilds), len(settings.channels), len(settings.trusted),
+            len(settings.chat),
             settings.require_mention, settings.dry_run,
         )
         return
