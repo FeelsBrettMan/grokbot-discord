@@ -19,29 +19,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import allowlist  # noqa: E402
+
 TOKEN_FILE = Path.home() / ".config/discord-bridge/secrets/discord_bot_token"
 SENT_LOG = Path.home() / ".local/state/discord-bridge/replied.txt"
 API = "https://discord.com/api/v10"
 UA = "DiscordBot (https://github.com/RudeDude/grokbot-discord, 0.2)"
 LIMIT = 1900
 
-
-
-def _allowed_channels() -> set[str]:
-    """DISCORD_CHANNEL_ALLOWLIST from env, else from ~/.config/discord-bridge/bridge.env.
-
-    Empty means nothing is allowed (fail closed).
-    """
-    raw = os.environ.get("DISCORD_CHANNEL_ALLOWLIST", "")
-    cfg = Path.home() / ".config/discord-bridge/bridge.env"
-    if not raw and cfg.is_file():
-        for line in cfg.read_text().splitlines():
-            if line.strip().startswith("DISCORD_CHANNEL_ALLOWLIST="):
-                raw = line.split("=", 1)[1]
-    return {c.strip() for c in raw.split(",") if c.strip().isdigit()}
-
-
-ALLOWED_CHANNELS = _allowed_channels()
 
 def split_message(text: str, limit: int = LIMIT) -> list[str]:
     text = (text or "").strip()
@@ -109,7 +95,7 @@ def main() -> int:
     ap.add_argument("--reply-to", default=None, help="message_id to reply to (first chunk only)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
-    if a.channel_id not in ALLOWED_CHANNELS:
+    if a.channel_id not in allowlist.load()["channels"]:
         print("refused: channel not allowlisted")
         return 2
     chunks = split_message(sys.stdin.read())

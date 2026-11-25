@@ -1,41 +1,29 @@
 #!/usr/bin/env python3
-"""Box-side context fetch for the Discord chat routine.
+"""Box-side context fetch for the Discord chat routine. Never prints the token.
 
-If the webhook body looks cut off, rebuild the full turn from Discord REST:
+Rebuild a truncated wake:
   python3 discord_fetch.py --channel-id ID --message-ids ID1,ID2 [--history 12]
-Prints JSON {"text": ..., "history": [...]} (history oldest first). Never prints the token.
+Catch messages that arrived while you were working (call right before posting):
+  python3 discord_fetch.py --channel-id ID --since MESSAGE_ID
+Prints JSON. Only allowed authors (allowlist.json) and this bot appear; each entry
+has author_id and trusted. Everyone else and other bots are left out.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import allowlist  # noqa: E402
+
 TOKEN_FILE = Path.home() / ".config/discord-bridge/secrets/discord_bot_token"
 API = "https://discord.com/api/v10"
-UA = "DiscordBot (https://github.com/RudeDude/grokbot-discord, 0.2)"
+UA = "DiscordBot (https://github.com/RudeDude/grokbot-discord, 0.3)"
 
-
-
-def _allowed_channels() -> set[str]:
-    """DISCORD_CHANNEL_ALLOWLIST from env, else from ~/.config/discord-bridge/bridge.env.
-
-    Empty means nothing is allowed (fail closed).
-    """
-    raw = os.environ.get("DISCORD_CHANNEL_ALLOWLIST", "")
-    cfg = Path.home() / ".config/discord-bridge/bridge.env"
-    if not raw and cfg.is_file():
-        for line in cfg.read_text().splitlines():
-            if line.strip().startswith("DISCORD_CHANNEL_ALLOWLIST="):
-                raw = line.split("=", 1)[1]
-    return {c.strip() for c in raw.split(",") if c.strip().isdigit()}
-
-
-ALLOWED_CHANNELS = _allowed_channels()
 
 def get(token: str, path: str):
     req = urllib.request.Request(
@@ -45,43 +33,62 @@ def get(token: str, path: str):
         return json.loads(resp.read())
 
 
+def shape(m: dict, allow: dict, bot_id: str) -> dict | None:
+    a = m.get("author") or {}
+    aid = str(a.get("id", ""))
+    is_self = aid == bot_id
+    trust = allowlist.trust_of(aid, allow)
+    if not is_self and (trust is None or a.get("bot")):
+        return None
+    return {
+        "message_id": str(m.get("id")),
+        "author_id": aid,
+        "author_name": a.get("global_name") or a.get("username"),
+        "trusted": trust == "trusted",
+        "is_bot": is_self,
+        "text": m.get("content") or "",
+        "timestamp": m.get("timestamp"),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--channel-id", required=True)
-    ap.add_argument("--message-ids", required=True)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--message-ids", help="comma-separated batch message IDs")
+    g.add_argument("--since", help="return allowed messages after this message ID")
     ap.add_argument("--history", type=int, default=12)
     a = ap.parse_args()
-    if a.channel_id not in ALLOWED_CHANNELS:
+    allow = allowlist.load()
+    if a.channel_id not in allow["channels"]:
         print(json.dumps({"error": "channel not allowlisted"}))
-        return 2
-    ids = [i for i in a.message_ids.split(",") if i.strip().isdigit()]
-    if not ids:
-        print(json.dumps({"error": "no valid message ids"}))
         return 2
     token = TOKEN_FILE.read_text().strip()
     try:
-        msgs = [get(token, f"/channels/{a.channel_id}/messages/{i}") for i in ids]
+        bot_id = str(get(token, "/users/@me").get("id", ""))
+        base = f"/channels/{a.channel_id}/messages"
+        if a.since:
+            if not a.since.isdigit():
+                print(json.dumps({"error": "--since must be a message ID"}))
+                return 2
+            raw = get(token, f"{base}?after={a.since}&limit=100")  # newest first
+            items = [x for x in (shape(m, allow, bot_id) for m in reversed(raw)) if x]
+            print(json.dumps({"since": a.since, "messages": items}, ensure_ascii=False))
+            return 0
+        ids = [i for i in a.message_ids.split(",") if i.strip().isdigit()]
+        if not ids:
+            print(json.dumps({"error": "no valid message ids"}))
+            return 2
+        msgs = [x for x in (shape(get(token, f"{base}/{i}"), allow, bot_id) for i in ids) if x]
         first = min(ids, key=int)
-        hist = get(
-            token,
-            f"/channels/{a.channel_id}/messages?before={first}&limit={max(1, min(a.history, 50))}",
-        )
+        lim = max(1, min(a.history * 4, 100))
+        hist_raw = get(token, f"{base}?before={first}&limit={lim}")
+        hist = [x for x in (shape(m, allow, bot_id) for m in hist_raw) if x][: a.history]
+        out = {"messages": msgs, "history": list(reversed(hist))}
     except Exception as exc:  # report only the type/status, never headers
-        print(json.dumps({"error": f"discord fetch failed: {type(exc).__name__} "
-                                   f"{getattr(exc, 'code', '')}".strip()}))
+        err = f"discord fetch failed: {type(exc).__name__} {getattr(exc, 'code', '')}".strip()
+        print(json.dumps({"error": err}))
         return 1
-    out = {
-        "text": "\n".join((m.get("content") or "").strip() for m in msgs if m.get("content")),
-        "history": [
-            {
-                "author": (m["author"].get("global_name") or m["author"].get("username")),
-                "is_bot": bool(m["author"].get("bot")),
-                "text": m.get("content") or "",
-                "timestamp": m.get("timestamp"),
-            }
-            for m in reversed(hist)
-        ],
-    }
     print(json.dumps(out, ensure_ascii=False))
     return 0
 

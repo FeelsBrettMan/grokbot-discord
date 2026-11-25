@@ -1,0 +1,6 @@
+{
+  "guilds": ["YOUR_GUILD_ID"],
+  "channels": ["YOUR_CHANNEL_ID"],
+  "trusted_authors": ["YOUR_DISCORD_USER_ID"],
+  "chat_authors": []
+}

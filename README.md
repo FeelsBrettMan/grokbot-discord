@@ -1,8 +1,9 @@
 # grokbot-discord (FeelsBrettMan fork)
 
 Chat with a Grok Bot from a private Discord channel as if it were the normal chat
-window: no @mention needed, replies follow the conversation, and only allowlisted
-people in an allowlisted channel can wake it.
+window, alone or as a small group: no @mention needed, replies follow the whole
+conversation, and only allowlisted people in an allowlisted channel can wake it.
+**Trusted** people get full control; **chat-only** people can only talk.
 
 Fork of [RudeDude/grokbot-discord](https://github.com/RudeDude/grokbot-discord) (MIT).
 It contains two ways to run the bridge:
@@ -19,18 +20,21 @@ Discord channel
    |  Gateway events (Guilds, GuildMessages, MessageContent)
    v
 Windows listener (windows-listener/, Task Scheduler, auto-restart)
-   |  fail-closed guild/channel/author allowlists, 3s debounce,
-   |  one run in flight per channel, catch-up after reconnect
+   |  fail-closed guild/channel allowlists, trusted + chat-only authors
+   |  (everyone else and other bots ignored), group batching since the bot's
+   |  last post, 3s debounce, one run in flight per channel, catch-up
    |  POST JSON + "Authorization: Bearer <routine webhook key>"
    v
 Grok Bot webhook routine  -> wakes the Bot (main chat) with the JSON body
-   |  correlation_id first ... text, history last (truncation-safe)
+   |  correlation_id first ... messages[] (with trusted flags), history last
    v
-Bot runs box/discord_post.py on its computer
+Bot re-fetches with box/discord_fetch.py --since <message_id>, then runs
+box/discord_post.py on its computer
    |  POST https://discord.com/api/v10/channels/{channel_id}/messages
    |  "Authorization: Bot <token read from a 600 file>", 1900-char chunks
    v
-Discord channel  (the listener sees the bot's post -> run finished -> next batch)
+Discord channel  (the listener sees the bot's post -> run finished, older buffered
+                  messages dropped as covered -> next batch)
 ```
 
 While a run is in flight the listener keeps the typing indicator alive. A run
@@ -45,9 +49,11 @@ ends when the bot posts in the channel or after 5 minutes.
    [docs/routine-prompt-discord-rest.md](docs/routine-prompt-discord-rest.md) as its
    instruction (fill in the IDs and helper path). Copy its webhook URL and key.
 3. **Bot computer**: put the bot token in `~/.config/discord-bridge/secrets/discord_bot_token`
-   (`chmod 600`) and `DISCORD_CHANNEL_ALLOWLIST=<channel id>` in
-   `~/.config/discord-bridge/bridge.env`; the `box/` helpers read those and refuse
-   any other channel.
+   (`chmod 600`) and copy [examples/allowlist.example.json](examples/allowlist.example.json)
+   to `~/.config/discord-bridge/allowlist.json` (`chmod 600`) with your IDs. The
+   `box/` helpers read it and refuse everything if it is missing or its channel or
+   trusted list is empty. Keep it in sync with the listener's `.env`
+   (`DISCORD_TRUSTED_AUTHORS`, `DISCORD_CHAT_AUTHORS`).
 4. **Windows PC**: follow [windows-listener/README.md](windows-listener/README.md)
    (`install.ps1`, fill `.env`, auto-start task; `update.ps1` for upgrades).
 5. Test: write in the channel. You should see the typing indicator, then a reply.
@@ -81,6 +87,8 @@ git-ignored, and all IDs in examples are placeholders.
 - **[lucklypriyansh-2/grok-bot-relay](https://github.com/lucklypriyansh-2/grok-bot-relay)** (MIT):
   the observation that long routine webhook bodies can be truncated, so small
   identifying fields go first.
+- The trusted vs chat-only split and group batching (v0.3.0 of the Windows
+  listener) are this fork's own design; no outside code.
 - Dependencies: [discord.py](https://github.com/Rapptz/discord.py) (MIT),
   [aiohttp](https://github.com/aio-libs/aiohttp) (Apache-2.0),
   [PyYAML](https://github.com/yaml/pyyaml) (MIT, box bridge only).
