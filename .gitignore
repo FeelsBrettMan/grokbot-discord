@@ -10,3 +10,15 @@ dist/
 build/
 bridge.log
 
+# local config / state (never commit)
+.env
+*.env
+!examples/*.env.example
+!windows-listener/.env.example
+secrets/
+data/
+logs/
+state.json
+*.log
+callback_secret
+LOCAL-*.md
