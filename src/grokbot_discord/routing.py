@@ -54,6 +54,7 @@ def route(
     *,
     self_user_id: str,
     default_bot: str,
+    require_mention: bool = True,
 ) -> Route | None:
     if not bots:
         return None
@@ -74,7 +75,7 @@ def route(
         if hit is not None:
             return Route(bot=hit, text=rest.strip())
 
-    if default_bot and self_user_id in msg.mention_user_ids:
+    if default_bot and (self_user_id in msg.mention_user_ids or not require_mention):
         bot = bots.get(default_bot) or aliases.get(default_bot.casefold())
         if bot is not None:
             return Route(bot=bot, text=text)

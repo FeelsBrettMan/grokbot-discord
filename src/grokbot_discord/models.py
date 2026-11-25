@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class IncomingMessage:
     content: str
     mention_user_ids: frozenset[str]
     mention_role_ids: frozenset[str]
+    author_is_bot: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,8 +43,10 @@ class WakePayload:
     message_id: str
     reply_url: str
     correlation_id: str
+    history: list[dict[str, Any]] = field(default_factory=list)
+    message_ids: list[str] = field(default_factory=list)
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "bot": self.bot,
             "text": self.text,
@@ -53,6 +57,8 @@ class WakePayload:
             "message_id": self.message_id,
             "reply_url": self.reply_url,
             "correlation_id": self.correlation_id,
+            "message_ids": list(self.message_ids),
+            "history": list(self.history),
         }
 
 
@@ -66,4 +72,6 @@ WAKE_FIELDS = (
     "message_id",
     "reply_url",
     "correlation_id",
+    "message_ids",
+    "history",
 )

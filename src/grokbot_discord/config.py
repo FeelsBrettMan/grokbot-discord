@@ -87,7 +87,7 @@ def load_bots(path: Path, *, dry_run: bool) -> tuple[str, dict[str, BotSpec]]:
 
 def load_settings(env_file: Path | None = None, bots_file: Path | None = None) -> Settings:
     if env_file is None:
-        env_file = Path(".env")
+        env_file = Path(os.environ.get("BRIDGE_ENV_FILE", ".env"))
     load_dotenv(env_file)
     dry_run = _truthy(os.environ.get("DRY_RUN", ""), False)
     token = os.environ.get("DISCORD_BOT_TOKEN", "")

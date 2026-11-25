@@ -65,6 +65,8 @@ def should_drop(
 ) -> str | None:
     if msg.author_id == self_user_id:
         return "self"
+    if msg.author_is_bot:
+        return "bot"
     if msg.guild_id not in guilds:
         return "guild"
     if msg.channel_id not in channels:

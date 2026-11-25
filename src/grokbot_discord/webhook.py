@@ -9,7 +9,7 @@ from grokbot_discord.models import WakePayload
 WEBHOOK_TIMEOUT_S = 8.0
 
 
-def webhook_request(url: str, key: str, payload: dict[str, str]) -> dict[str, Any]:
+def webhook_request(url: str, key: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "url": url,
         "json": payload,
@@ -23,7 +23,7 @@ def webhook_request(url: str, key: str, payload: dict[str, str]) -> dict[str, An
 
 
 class DryRunResult:
-    def __init__(self, url: str, payload: dict[str, str]) -> None:
+    def __init__(self, url: str, payload: dict[str, Any]) -> None:
         self.url = url
         self.payload = payload
         self.status = 200

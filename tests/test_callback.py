@@ -8,6 +8,7 @@ async def test_health_and_auth():
 
     async def on_reply(correlation_id, channel_id, message_id, text):
         seen.append((correlation_id, channel_id, message_id, text))
+        return correlation_id == "x"
 
     app = build_app("s3cret", on_reply)
     async with TestClient(TestServer(app)) as client:
@@ -28,3 +29,17 @@ async def test_health_and_auth():
         )
         assert ok.status == 200
         assert seen == [("x", "c", "m", "hi")]
+
+
+async def test_unknown_correlation_rejected():
+    async def on_reply(correlation_id, channel_id, message_id, text):
+        return False
+
+    app = build_app("s3cret", on_reply)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/reply",
+            json={"correlation_id": "nope", "channel_id": "c", "message_id": "m", "text": "hi"},
+            headers={"Authorization": "Bearer s3cret"},
+        )
+        assert resp.status == 404

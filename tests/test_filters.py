@@ -35,6 +35,7 @@ def test_drops():
     assert should_drop(make_msg(guild_id="nope", message_id="m3"), **kwargs) == "guild"
     assert should_drop(make_msg(channel_id="nope", message_id="m4"), **kwargs) == "channel"
     assert should_drop(make_msg(author_id="stranger", message_id="m5"), **kwargs) == "author"
+    assert should_drop(make_msg(author_is_bot=True, message_id="m5b"), **kwargs) == "bot"
     assert (
         should_drop(
             make_msg(

@@ -9,16 +9,21 @@ from typing import Any
 import aiohttp
 import discord
 
+from grokbot_discord.batching import ChannelBatcher
 from grokbot_discord.callback import build_app, start_site
 from grokbot_discord.config import ConfigError, Settings, load_settings
-from grokbot_discord.filters import Dedupe, InFlight, should_drop
-from grokbot_discord.models import IncomingMessage, WakePayload
+from grokbot_discord.filters import Dedupe, should_drop
+from grokbot_discord.history import HISTORY_LIMIT, cap_history, history_entry
+from grokbot_discord.models import BotSpec, IncomingMessage, WakePayload
 from grokbot_discord.routing import addressed_by_name, mapped_role_ids, route
 from grokbot_discord.split import split_message
 from grokbot_discord.webhook import DryRunResult, ping
 
 log = logging.getLogger("grokbot_discord")
-ACK_TEXT = "Got it."
+PENDING_TTL_S = 15 * 60  # local hardening: expire unanswered wakes
+DEBOUNCE_S = 3.0  # wait this long after the owner's last message before waking
+TYPING_EVERY_S = 8.0  # Discord typing indicator lasts ~10s
+TICK_S = 0.5
 
 
 def _incoming(message: discord.Message) -> IncomingMessage:
@@ -32,7 +37,12 @@ def _incoming(message: discord.Message) -> IncomingMessage:
         content=message.content or "",
         mention_user_ids=frozenset(str(u.id) for u in message.mentions),
         mention_role_ids=frozenset(str(r.id) for r in message.role_mentions),
+        author_is_bot=bool(message.author.bot),
     )
+
+
+def combine_texts(texts: list[str]) -> str:
+    return "\n".join(t for t in (x.strip() for x in texts) if t)
 
 
 class BridgeClient(discord.Client):
@@ -44,11 +54,14 @@ class BridgeClient(discord.Client):
         super().__init__(intents=intents, **kwargs)
         self.settings = settings
         self.dedupe = Dedupe()
-        self.in_flight = InFlight(settings.in_flight_per_channel)
-        self.pending: dict[str, tuple[str, str]] = {}
+        self.batcher = ChannelBatcher(debounce_s=DEBOUNCE_S, ttl_s=PENDING_TTL_S)
+        # channel_id -> (bot spec, list of routed texts aligned with buffer)
+        self.routed: dict[str, list[tuple[BotSpec, str]]] = {}
+        self.last_typing: dict[str, float] = {}
         self.http_session: aiohttp.ClientSession | None = None
         self._runner = None
-        self.dry_run_log: list[dict[str, str]] = []
+        self._tick_task: asyncio.Task | None = None
+        self.dry_run_log: list[dict[str, Any]] = []
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
@@ -56,8 +69,11 @@ class BridgeClient(discord.Client):
         self._runner = await start_site(
             app, self.settings.callback_bind, self.settings.callback_port
         )
+        self._tick_task = asyncio.create_task(self._tick_loop())
 
     async def close(self) -> None:
+        if self._tick_task is not None:
+            self._tick_task.cancel()
         if self.http_session is not None:
             await self.http_session.close()
         if self._runner is not None:
@@ -65,7 +81,18 @@ class BridgeClient(discord.Client):
         await super().close()
 
     async def on_ready(self) -> None:
-        log.info("online as %s", self.user)
+        log.info(
+            "online as %s (require_mention=%s debounce=%ss)",
+            self.user, self.settings.require_mention, DEBOUNCE_S,
+        )
+        for gid in sorted(self.settings.guilds):
+            g = self.get_guild(int(gid))
+            name = g.name if g else "-"
+            log.info("allowlisted guild %s visible=%s name=%s", gid, g is not None, name)
+        for cid in sorted(self.settings.channels):
+            c = self.get_channel(int(cid))
+            name = getattr(c, "name", "-")
+            log.info("allowlisted channel %s visible=%s name=%s", cid, c is not None, name)
 
     async def on_message(self, message: discord.Message) -> None:
         if self.user is None:
@@ -91,44 +118,101 @@ class BridgeClient(discord.Client):
             self.settings.bots,
             self_user_id=self_id,
             default_bot=self.settings.default_bot,
+            require_mention=self.settings.require_mention,
         )
         if hit is None:
-            names = ", ".join(sorted(self.settings.bots))
-            await message.channel.send(f"unknown bot. configured: {names}")
+            log.info("no route for message_id=%s; dropped", msg.message_id)
             return
-        if not self.in_flight.acquire(msg.channel_id):
+        self.routed.setdefault(msg.channel_id, []).append((hit.bot, hit.text))
+        self.batcher.add(msg)
+        await self._typing(msg.channel_id, force=True)
+
+    # ---- scheduling -------------------------------------------------------
+
+    async def _tick_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(TICK_S)
+                await self._tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("tick failed")
+
+    async def _tick(self) -> None:
+        for cid in self.batcher.expire():
+            log.warning("wake in channel %s expired without a reply; slot released", cid)
+        for cid in self.batcher.ready_channels():
+            await self._flush(cid)
+        for cid in list(self.batcher.channels):
+            if self.batcher.active(cid):
+                await self._typing(cid)
+
+    async def _typing(self, channel_id: str, *, force: bool = False) -> None:
+        now = self.batcher.clock()
+        if not force and now - self.last_typing.get(channel_id, 0.0) < TYPING_EVERY_S:
             return
+        self.last_typing[channel_id] = now
         try:
-            await message.reply(ACK_TEXT, mention_author=False)
+            channel = self.get_channel(int(channel_id))
+            if channel is not None:
+                await channel.typing()
         except Exception:
-            log.exception("ack failed for message_id=%s", msg.message_id)
+            log.warning("typing indicator failed in channel %s", channel_id)
+
+    async def _history(self, channel_id: str, before_message_id: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        try:
+            channel = self.get_channel(int(channel_id))
+            if channel is None or not hasattr(channel, "history"):
+                return []
+            before = discord.Object(id=int(before_message_id))
+            async for m in channel.history(limit=HISTORY_LIMIT, before=before, oldest_first=False):
+                author = str(getattr(m.author, "display_name", m.author.name))
+                ts = m.created_at.isoformat()
+                items.append(history_entry(author, bool(m.author.bot), m.content or "", ts))
+        except Exception:
+            log.warning("history fetch failed in channel %s", channel_id)
+            return []
+        items.reverse()  # oldest first
+        return cap_history(items)
+
+    async def _flush(self, channel_id: str) -> None:
         correlation_id = uuid.uuid4().hex
-        self.pending[correlation_id] = (msg.channel_id, msg.message_id)
+        batch = self.batcher.take(channel_id, correlation_id)
+        routed = self.routed.pop(channel_id, [])
+        if not batch:
+            return
+        bot = routed[-1][0] if routed else self.settings.bots[self.settings.default_bot]
+        text = combine_texts([t for _b, t in routed]) or combine_texts([m.content for m in batch])
+        first, last = batch[0], batch[-1]
+        history = await self._history(channel_id, first.message_id)
         payload = WakePayload(
-            bot=hit.bot.name,
-            text=hit.text,
-            author_id=msg.author_id,
-            author_name=msg.author_name,
-            channel_id=msg.channel_id,
-            guild_id=msg.guild_id,
-            message_id=msg.message_id,
+            bot=bot.name,
+            text=text,
+            author_id=last.author_id,
+            author_name=last.author_name,
+            channel_id=channel_id,
+            guild_id=last.guild_id,
+            message_id=last.message_id,
             reply_url=f"{self.settings.callback_public_url}/reply",
             correlation_id=correlation_id,
+            history=history,
+            message_ids=[m.message_id for m in batch],
         )
-        asyncio.create_task(self._wake(hit.bot.webhook_url, hit.bot.webhook_key, payload))
+        log.info(
+            "waking bot=%s channel=%s batched=%d history=%d",
+            bot.name, channel_id, len(batch), len(history),
+        )
+        await self._typing(channel_id, force=True)
+        asyncio.create_task(self._wake(bot.webhook_url, bot.webhook_key, payload))
 
     async def _wake(self, url: str, key: str, payload: WakePayload) -> None:
-        keep_pending = False
+        ok = False
         try:
             if self.http_session is None:
                 return
-            result = await ping(
-                self.http_session,
-                url,
-                key,
-                payload,
-                dry_run=self.settings.dry_run,
-            )
+            result = await ping(self.http_session, url, key, payload, dry_run=self.settings.dry_run)
             if isinstance(result, DryRunResult):
                 self.dry_run_log.append(result.payload)
                 log.info("DRY_RUN would POST webhook for bot=%s", payload.bot)
@@ -136,44 +220,40 @@ class BridgeClient(discord.Client):
             if result != 200:
                 log.warning("webhook wake returned %s for bot=%s", result, payload.bot)
                 return
-            keep_pending = True
+            ok = True
         except TimeoutError:
             log.warning("webhook wake timed out for bot=%s", payload.bot)
         except aiohttp.ClientError:
             log.exception("webhook wake failed for bot=%s", payload.bot)
         finally:
-            if keep_pending:
-                return
-            self.in_flight.release(payload.channel_id)
-            self.pending.pop(payload.correlation_id, None)
+            if not ok:
+                self.batcher.release(payload.correlation_id)
 
     async def _on_callback(
         self, correlation_id: str, channel_id: str, message_id: str, text: str
-    ) -> None:
-        pending = self.pending.pop(correlation_id, None)
-        ref_channel, ref_message = pending if pending else (channel_id, message_id)
+    ) -> bool:
+        # local hardening: replies only go to the channel of the in-flight,
+        # allowlisted wake; body channel_id/message_id are ignored.
+        ref_channel = self.batcher.channel_for(correlation_id)
+        if ref_channel is None:
+            return False
+        if ref_channel not in self.settings.channels:
+            self.batcher.release(correlation_id)
+            return False
+        chunks = split_message(text)
         try:
-            channel = self.get_channel(int(ref_channel))
-            if channel is None:
-                channel = await self.fetch_channel(int(ref_channel))
-            chunks = split_message(text)
-            reference = None
-            if ref_message:
-                try:
-                    reference = discord.MessageReference(
-                        message_id=int(ref_message),
-                        channel_id=int(ref_channel),
-                        fail_if_not_exists=False,
-                    )
-                except ValueError:
-                    reference = None
-            for i, chunk in enumerate(chunks):
-                kwargs: dict[str, Any] = {}
-                if i == 0 and reference is not None:
-                    kwargs["reference"] = reference
-                await channel.send(chunk, **kwargs)
+            if chunks:
+                channel = self.get_channel(int(ref_channel))
+                if channel is None:
+                    channel = await self.fetch_channel(int(ref_channel))
+                for chunk in chunks:
+                    await channel.send(chunk)
         finally:
-            self.in_flight.release(ref_channel)
+            self.batcher.release(correlation_id)
+            # typing stops on its own once the channel is idle; reset so the
+            # next batch (if any) shows typing immediately
+            self.last_typing.pop(ref_channel, None)
+        return True
 
 
 def main() -> None:
@@ -187,4 +267,4 @@ def main() -> None:
         log.error("%s", exc)
         sys.exit(2)
     client = BridgeClient(settings)
-    client.run(settings.discord_token)
+    client.run(settings.discord_token, log_handler=None)

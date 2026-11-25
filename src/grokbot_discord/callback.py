@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import logging
 from collections.abc import Awaitable, Callable
 
@@ -10,7 +11,7 @@ from grokbot_discord.split import split_message
 
 log = logging.getLogger("grokbot_discord")
 
-ReplyHandler = Callable[[str, str, str, str], Awaitable[None]]
+ReplyHandler = Callable[[str, str, str, str], Awaitable[bool]]
 
 
 def _bearer(header: str) -> str:
@@ -30,7 +31,7 @@ def build_app(secret: str, on_reply: ReplyHandler) -> web.Application:
 
     async def reply(request: web.Request) -> web.Response:
         token = _bearer(request.headers.get("Authorization", ""))
-        if not secret or token != secret:
+        if not secret or not token or not hmac.compare_digest(token, secret):
             return web.Response(status=401, text="unauthorized")
         try:
             body = await request.json()
@@ -45,9 +46,12 @@ def build_app(secret: str, on_reply: ReplyHandler) -> web.Application:
         if not correlation_id or not channel_id:
             return web.Response(status=400, text="missing fields")
         chunks = split_message(text)
+        # local hardening: only answer pending wakes; empty text releases the slot silently
+        accepted = await on_reply(correlation_id, channel_id, message_id, text)
+        if not accepted:
+            return web.Response(status=404, text="unknown correlation_id")
         if not chunks:
             return web.Response(status=204)
-        await on_reply(correlation_id, channel_id, message_id, text)
         return web.json_response({"ok": True, "chunks": len(chunks)})
 
     app.router.add_get("/health", health)
