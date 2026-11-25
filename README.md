@@ -1,4 +1,101 @@
-# grokbot-discord
+# grokbot-discord (FeelsBrettMan fork)
+
+Chat with a Grok Bot from a private Discord channel as if it were the normal chat
+window: no @mention needed, replies follow the conversation, and only allowlisted
+people in an allowlisted channel can wake it.
+
+Fork of [RudeDude/grokbot-discord](https://github.com/RudeDude/grokbot-discord) (MIT).
+It contains two ways to run the bridge:
+
+| | Where the listener runs | How replies get back |
+|---|---|---|
+| **Windows listener** (`windows-listener/`, recommended) | an always-on Windows PC | the routine posts to Discord REST itself (`box/discord_post.py`) |
+| **Box bridge** (`src/grokbot_discord/`, original layout) | the Grok Bot computer | the routine POSTs to the bridge's local `/reply` callback |
+
+## Architecture (Windows listener)
+
+```
+Discord channel
+   |  Gateway events (Guilds, GuildMessages, MessageContent)
+   v
+Windows listener (windows-listener/, Task Scheduler, auto-restart)
+   |  fail-closed guild/channel/author allowlists, 3s debounce,
+   |  one run in flight per channel, catch-up after reconnect
+   |  POST JSON + "Authorization: Bearer <routine webhook key>"
+   v
+Grok Bot webhook routine  -> wakes the Bot (main chat) with the JSON body
+   |  correlation_id first ... text, history last (truncation-safe)
+   v
+Bot runs box/discord_post.py on its computer
+   |  POST https://discord.com/api/v10/channels/{channel_id}/messages
+   |  "Authorization: Bot <token read from a 600 file>", 1900-char chunks
+   v
+Discord channel  (the listener sees the bot's post -> run finished -> next batch)
+```
+
+While a run is in flight the listener keeps the typing indicator alive. A run
+ends when the bot posts in the channel or after 5 minutes.
+
+## Setup
+
+1. **Discord app**: New Application, Bot, turn on **Message Content Intent**, reset
+   the token. Invite with scope `bot` and permissions View Channels, Send Messages,
+   Read Message History (`68608`). Never Administrator. Use a private server.
+2. **Grok Bot routine**: create a routine with a webhook trigger and paste
+   [docs/routine-prompt-discord-rest.md](docs/routine-prompt-discord-rest.md) as its
+   instruction (fill in the IDs and helper path). Copy its webhook URL and key.
+3. **Bot computer**: put the bot token in `~/.config/discord-bridge/secrets/discord_bot_token`
+   (`chmod 600`) and `DISCORD_CHANNEL_ALLOWLIST=<channel id>` in
+   `~/.config/discord-bridge/bridge.env`; the `box/` helpers read those and refuse
+   any other channel.
+4. **Windows PC**: follow [windows-listener/README.md](windows-listener/README.md)
+   (`install.ps1`, fill `.env`, auto-start task; `update.ps1` for upgrades).
+5. Test: write in the channel. You should see the typing indicator, then a reply.
+
+Run only one listener per bot token, or every message is forwarded twice.
+
+Secrets never go in this repo: `.env`, `secrets/`, `data/state.json` and logs are
+git-ignored, and all IDs in examples are placeholders.
+
+## Credits
+
+- **[RudeDude/grokbot-discord](https://github.com/RudeDude/grokbot-discord)** (MIT,
+  Don J. Rude): the base of this fork. Python discord.py gateway, fail-closed
+  guild/channel/author allowlists, webhook wake with Bearer key, `/reply`
+  callback, message splitting, `bots.yaml` routing, tests,
+  [COMPARISON.md](COMPARISON.md).
+- **[larry-fuqua/discord-grok-bot-kit](https://github.com/larry-fuqua/discord-grok-bot-kit)**
+  (MIT): RudeDude adopted the kit's leading bot-name wake, the instant "Got it."
+  pickup ack (this fork replaces it with a typing indicator) and the
+  `watch.sh` / `ensure-up.sh` keep-alive pattern plus keep-alive routine, as
+  described in COMPARISON.md (written by RudeDude, comparing against the kit at
+  commit [`0797998`](https://github.com/larry-fuqua/discord-grok-bot-kit/commit/0797998fbcd1e601c4bb42ae661edcc9ab911710)).
+  The kit's idea of the Bot posting to Discord REST directly (`bin/discord-send`)
+  inspired this fork's `box/discord_post.py`.
+- **[RealDragonJT/grok-discord-bridge](https://github.com/RealDragonJT/grok-discord-bridge)**
+  (MIT): ideas only, no code. Running the listener on an always-on host instead
+  of the Grok Bot computer, and catching up on messages missed while offline.
+- **[NinjaProtocol/grokbot-discord-plugin](https://github.com/NinjaProtocol/grokbot-discord-plugin)**
+  (MIT): ideas only, no code. Redacting Discord tokens from logs and allowing only
+  one Gateway connection per bot token.
+- **[lucklypriyansh-2/grok-bot-relay](https://github.com/lucklypriyansh-2/grok-bot-relay)** (MIT):
+  the observation that long routine webhook bodies can be truncated, so small
+  identifying fields go first.
+- Dependencies: [discord.py](https://github.com/Rapptz/discord.py) (MIT),
+  [aiohttp](https://github.com/aio-libs/aiohttp) (Apache-2.0),
+  [PyYAML](https://github.com/yaml/pyyaml) (MIT, box bridge only).
+
+---
+
+# Box bridge (original grokbot-discord README)
+
+Fork changes in the box bridge: `/reply` only answers a pending wake and posts to
+that wake's allowlisted channel; one wake in flight per channel with a 3s
+debounce and 15-min expiry; `history` and `message_ids` in the payload; typing
+indicator instead of the "Got it." ack; `REQUIRE_MENTION=false` routes to the
+default bot; [run-bridge.sh](run-bridge.sh) keep-alive launcher with config in
+`~/.config/discord-bridge` ([examples/](examples/)); callback routine prompt in
+[docs/routine-prompt-callback.md](docs/routine-prompt-callback.md).
 
 Python Discord gateway for talking to Grok Bots from a private server. One Discord bot, many Grok Bots. Built so you can chat from a phone anywhere Discord works.
 
